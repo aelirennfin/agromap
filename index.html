@@ -1,0 +1,272 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Контур поля</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>
+  :root {
+    --bg: var(--tg-theme-bg-color, #ffffff);
+    --text: var(--tg-theme-text-color, #1c1c1e);
+    --hint: var(--tg-theme-hint-color, #8e8e93);
+    --btn: var(--tg-theme-button-color, #2e7d32);
+    --btn-text: var(--tg-theme-button-text-color, #ffffff);
+    --sec: var(--tg-theme-secondary-bg-color, #f2f2f7);
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; font: 15px/1.3 -apple-system, "Segoe UI", Roboto, sans-serif;
+               background: var(--bg); color: var(--text); overflow: hidden; }
+  #app { display: flex; flex-direction: column; height: 100%; }
+  #top { padding: 8px; display: flex; flex-direction: column; gap: 6px; background: var(--bg); z-index: 2; }
+  .row { display: flex; gap: 6px; }
+  input { flex: 1; min-width: 0; padding: 9px 10px; border-radius: 10px; border: 1px solid var(--sec);
+          background: var(--sec); color: var(--text); font-size: 15px; outline: none; }
+  button { padding: 9px 12px; border-radius: 10px; border: 0; background: var(--sec); color: var(--text);
+           font-size: 14px; cursor: pointer; white-space: nowrap; }
+  button.primary { background: var(--btn); color: var(--btn-text); font-weight: 600; }
+  button:disabled { opacity: .45; }
+  #map { flex: 1; position: relative; }
+  #info { position: absolute; left: 8px; right: 8px; bottom: 24px; z-index: 1000; display: flex; gap: 6px;
+          align-items: center; pointer-events: none; }
+  #info > * { pointer-events: auto; }
+  #status { flex: 1; background: rgba(0,0,0,.65); color: #fff; padding: 8px 10px; border-radius: 10px; font-size: 14px; }
+  #save { display: none; }
+  body.no-tg #save { display: inline-block; }
+  .vertex { width: 18px; height: 18px; margin: -9px 0 0 -9px; border-radius: 50%; background: #fff;
+            border: 3px solid #ffeb3b; box-shadow: 0 0 3px rgba(0,0,0,.6); }
+  .vertex.first { border-color: #4caf50; }
+  #results { display: none; flex-direction: column; background: var(--sec); border-radius: 10px; overflow: hidden; }
+  #results div { padding: 8px 10px; border-bottom: 1px solid var(--bg); cursor: pointer; font-size: 14px; }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="top">
+    <div class="row">
+      <input id="name" placeholder="Название поля" maxlength="60">
+    </div>
+    <div class="row">
+      <input id="q" placeholder="Поиск: село или координаты 54.87, 69.15" enterkeyhint="search">
+      <button id="go">🔍</button>
+      <button id="locate" title="Где я">📍</button>
+    </div>
+    <div id="results"></div>
+    <div class="row">
+      <button id="undo" disabled>↶ Точка</button>
+      <button id="clear" disabled>✕ Сначала</button>
+      <span style="flex:1"></span>
+      <button id="save" class="primary" disabled>Сохранить</button>
+    </div>
+  </div>
+  <div id="map">
+    <div id="info"><div id="status">Нажимайте по углам поля по порядку, обходя его по кругу</div></div>
+  </div>
+</div>
+
+<script>
+(function () {
+  const tg = window.Telegram && window.Telegram.WebApp;
+  const inTelegram = !!(tg && tg.initData);
+  if (!inTelegram) document.body.classList.add("no-tg");
+  if (tg) {
+    tg.ready(); tg.expand();
+    try { tg.disableVerticalSwipes(); } catch (e) {}  // чтобы окно не закрывалось, когда двигаете карту
+  }
+
+  const params = new URLSearchParams(location.search);
+  const $ = (id) => document.getElementById(id);
+  if (params.get("name")) $("name").value = params.get("name");
+
+  // ---------- карта ----------
+  const map = L.map("map", { zoomControl: false, attributionControl: true });
+  L.control.zoom({ position: "topright" }).addTo(map);
+  const sat = L.tileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+    { maxZoom: 19, maxNativeZoom: 18, attribution: "Снимки © Esri, Maxar, Earthstar Geographics" }).addTo(map);
+  const labels = L.tileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}",
+    { maxZoom: 19, maxNativeZoom: 18, opacity: 0.9 }).addTo(map);
+  const osm = L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+    { maxZoom: 19, attribution: "© OpenStreetMap" });
+  L.control.layers({ "Спутник": sat, "Схема": osm }, { "Подписи": labels }, { position: "topright" }).addTo(map);
+
+  // стартовый вид: из адреса (?lat=&lon=&z=), иначе последний вид, иначе Северный Казахстан
+  function startView() {
+    const lat = parseFloat(params.get("lat")), lon = parseFloat(params.get("lon"));
+    if (isFinite(lat) && isFinite(lon)) return [[lat, lon], parseInt(params.get("z") || "14", 10)];
+    try {
+      const v = JSON.parse(localStorage.getItem("agro_view") || "null");
+      if (v) return [[v.lat, v.lon], v.z];
+    } catch (e) {}
+    return [[54.0, 69.5], 7];
+  }
+  const sv = startView();
+  map.setView(sv[0], sv[1]);
+  map.on("moveend", () => {
+    const c = map.getCenter();
+    try { localStorage.setItem("agro_view", JSON.stringify({ lat: c.lat, lon: c.lng, z: map.getZoom() })); } catch (e) {}
+  });
+
+  // ---------- рисование ----------
+  let pts = [];            // [{lat, lng}]
+  let markers = [];
+  const poly = L.polygon([], { color: "#ffeb3b", weight: 3, fillColor: "#ffeb3b", fillOpacity: 0.2 }).addTo(map);
+  const line = L.polyline([], { color: "#ffeb3b", weight: 3, dashArray: "6 6" }).addTo(map);
+
+  function icon(first) {
+    return L.divIcon({ className: "", html: '<div class="vertex' + (first ? " first" : "") + '"></div>', iconSize: [0, 0] });
+  }
+
+  function areaHa(p) {
+    if (p.length < 3) return 0;
+    const R = 6371000, lat0 = p.reduce((s, x) => s + x.lat, 0) / p.length * Math.PI / 180;
+    const xy = p.map(x => [x.lng * Math.PI / 180 * R * Math.cos(lat0), x.lat * Math.PI / 180 * R]);
+    let s = 0;
+    for (let i = 0; i < xy.length; i++) {
+      const a = xy[i], b = xy[(i + 1) % xy.length];
+      s += a[0] * b[1] - b[0] * a[1];
+    }
+    return Math.abs(s) / 2 / 10000;
+  }
+
+  function redraw() {
+    markers.forEach(m => map.removeLayer(m));
+    markers = pts.map((p, i) => {
+      const m = L.marker(p, { icon: icon(i === 0), draggable: true, autoPan: true }).addTo(map);
+      m.on("drag", (e) => { pts[i] = e.target.getLatLng(); redrawShape(); });
+      m.on("dragend", () => redraw());
+      m.on("click", () => { if (i === 0 && pts.length >= 3) finishHint(); });
+      return m;
+    });
+    redrawShape();
+  }
+
+  function redrawShape() {
+    if (pts.length >= 3) { poly.setLatLngs(pts); line.setLatLngs([]); }
+    else { poly.setLatLngs([]); line.setLatLngs(pts); }
+    const ha = areaHa(pts);
+    const n = pts.length;
+    $("status").textContent = n === 0 ? "Нажимайте по углам поля по порядку, обходя его по кругу"
+      : n < 3 ? `Точек: ${n}. Нужно минимум 3`
+      : `Точек: ${n} · площадь ≈ ${ha.toFixed(1)} га. Точки можно перетаскивать`;
+    $("undo").disabled = n === 0;
+    $("clear").disabled = n === 0;
+    const ready = n >= 3;
+    $("save").disabled = !ready;
+    if (tg && inTelegram) {
+      if (ready) {
+        tg.MainButton.setText(`Сохранить поле (${ha.toFixed(1)} га)`);
+        tg.MainButton.show(); tg.MainButton.enable();
+      } else {
+        tg.MainButton.hide();
+      }
+    }
+  }
+
+  function finishHint() {
+    $("status").textContent = `Контур замкнут · ${areaHa(pts).toFixed(1)} га. Нажмите «Сохранить поле» внизу`;
+    if (tg && tg.HapticFeedback) tg.HapticFeedback.notificationOccurred("success");
+  }
+
+  map.on("click", (e) => {
+    if (pts.length >= 150) { $("status").textContent = "Не больше 150 точек"; return; }
+    pts.push(e.latlng);
+    if (tg && tg.HapticFeedback) tg.HapticFeedback.selectionChanged();
+    redraw();
+  });
+  $("undo").onclick = () => { pts.pop(); redraw(); };
+  $("clear").onclick = () => { pts = []; redraw(); };
+
+  // ---------- сохранение ----------
+  function payload() {
+    return JSON.stringify({
+      v: 1,
+      name: $("name").value.trim().slice(0, 60),
+      pts: pts.map(p => [+p.lat.toFixed(6), +p.lng.toFixed(6)]),
+    });
+  }
+  function save() {
+    if (pts.length < 3) return;
+    if (!$("name").value.trim()) {
+      $("name").focus();
+      $("status").textContent = "Введите название поля вверху";
+      if (tg && tg.HapticFeedback) tg.HapticFeedback.notificationOccurred("error");
+      return;
+    }
+    const data = payload();
+    if (inTelegram) {
+      tg.sendData(data);  // бот получит поле, окно закроется само
+    } else {
+      // открыто в обычном браузере — показываем, что ушло бы в бота
+      $("status").textContent = "Вне Telegram. Данные: " + data;
+      window.__lastPayload = data;
+    }
+  }
+  if (tg) tg.MainButton.onClick(save);
+  $("save").onclick = save;
+
+  // ---------- поиск ----------
+  async function search() {
+    const q = $("q").value.trim();
+    $("results").style.display = "none";
+    if (!q) return;
+    const m = q.match(/(-?\d{1,2}[.,]\d+)\s*[,; ]\s*(-?\d{1,3}[.,]\d+)/);
+    if (m) {
+      const lat = parseFloat(m[1].replace(",", ".")), lon = parseFloat(m[2].replace(",", "."));
+      map.setView([lat, lon], 15);
+      return;
+    }
+    try {
+      const url = "https://nominatim.openstreetmap.org/search?format=json&limit=5&accept-language=ru&countrycodes=kz,ru&q=" + encodeURIComponent(q);
+      const res = await (await fetch(url)).json();
+      if (!res.length) { $("status").textContent = "Ничего не нашёл. Попробуйте «Винное, СКО» или координаты"; return; }
+      const box = $("results");
+      box.innerHTML = "";
+      res.forEach(r => {
+        const d = document.createElement("div");
+        d.textContent = r.display_name;
+        d.onclick = () => { map.setView([+r.lat, +r.lon], 14); box.style.display = "none"; $("q").blur(); };
+        box.appendChild(d);
+      });
+      box.style.display = "flex";
+    } catch (e) {
+      $("status").textContent = "Поиск сейчас недоступен";
+    }
+  }
+  $("go").onclick = search;
+  $("q").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); search(); } });
+
+  // ---------- геопозиция ----------
+  let me = null;
+  function showMe(lat, lon) {
+    if (me) map.removeLayer(me);
+    me = L.circleMarker([lat, lon], { radius: 8, color: "#fff", weight: 3, fillColor: "#2196f3", fillOpacity: 1 }).addTo(map);
+    map.setView([lat, lon], 16);
+  }
+  $("locate").onclick = () => {
+    const lm = tg && tg.LocationManager;
+    if (inTelegram && lm && lm.init) {
+      lm.init(() => {
+        if (lm.isLocationAvailable) {
+          lm.getLocation((loc) => {
+            if (loc) showMe(loc.latitude, loc.longitude);
+            else if (!lm.isAccessGranted && lm.openSettings) lm.openSettings();
+          });
+        } else browserLocate();
+      });
+    } else browserLocate();
+  };
+  function browserLocate() {
+    if (!navigator.geolocation) { $("status").textContent = "Геопозиция недоступна"; return; }
+    navigator.geolocation.getCurrentPosition(
+      (p) => showMe(p.coords.latitude, p.coords.longitude),
+      () => { $("status").textContent = "Нет доступа к геопозиции — разрешите его в настройках"; },
+      { enableHighAccuracy: true, timeout: 15000 });
+  }
+
+  redraw();
+})();
+</script>
+</body>
+</html>
